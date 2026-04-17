@@ -1,0 +1,31 @@
+.topicBar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
+.topic,
+.topicActive {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.topic:hover {
+  color: var(--text);
+  background: #f8fafc;
+}
+
+.topicActive {
+  border-color: rgba(59, 130, 246, 0.35);
+  background: var(--accent-soft);
+  color: var(--accent-from);
+  font-weight: 600;
+}
