@@ -47,8 +47,8 @@ const modules = [
     to: "/intel",
     title: "更多资讯",
     description:
-      "AI 从网络检索芯片失效分析相关学术与公开资料，按策略捕获并同步至知识库分类。",
-    tag: "AI 采集",
+      "从网络检索芯片失效分析相关学术与公开资料，按策略捕获并同步至知识库分类。",
+    tag: "资讯采集",
     Icon: IconIntelFeed,
   },
   {
@@ -110,7 +110,7 @@ export default function Dashboard() {
   return (
     <div className={styles.page}>
       <header className={styles.hero}>
-        <p className={styles.eyebrow}>企业工作台 · AI 辅助</p>
+        <p className={styles.eyebrow}>企业工作台</p>
         <h1 className={styles.title}>
           <span className={styles.titleAccent}>FA</span> 数据平台
         </h1>

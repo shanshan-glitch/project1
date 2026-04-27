@@ -11,3 +11,11 @@ export function feishuOAuthLoginHref(): string {
   if (typeof window === "undefined") return "#";
   return apiUrl(`/api/auth/feishu/login?next_origin=${encodeURIComponent(window.location.origin)}`);
 }
+
+/** 调用本机 / 部署的 sync-server 上受保护的接口时使用 */
+export function syncApiHeaders(): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json; charset=utf-8" };
+  const k = (import.meta.env.VITE_SYNC_API_KEY ?? "").trim();
+  if (k) h["X-Api-Key"] = k;
+  return h;
+}

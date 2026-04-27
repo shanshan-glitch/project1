@@ -30,6 +30,13 @@
   border: 1px dashed rgba(148, 163, 184, 0.45);
 }
 
+.errorText {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #b91c1c;
+  line-height: 1.5;
+}
+
 .label {
   display: block;
   font-size: 0.8rem;

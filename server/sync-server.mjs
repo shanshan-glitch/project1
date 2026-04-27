@@ -314,6 +314,258 @@ async function fetchDocxRawText(accessToken, documentId, authMode = "tenant") {
   );
 }
 
+function buildFeishuDocWebUrl(type, token) {
+  const t = String(type || "");
+  const k = String(token || "");
+  if (!k) return "";
+  if (t === "docx") return `https://feishu.cn/docx/${k}`;
+  if (t === "sheet") return `https://feishu.cn/sheets/${k}`;
+  if (t === "wiki") return `https://feishu.cn/wiki/${k}`;
+  if (t === "bitable") return `https://feishu.cn/base/${k}`;
+  if (t === "doc") return `https://feishu.cn/docs/${k}`;
+  return "";
+}
+
+/**
+ * 基于用户态 token 拉取「当前用户可读」云文档列表（Drive）。
+ * 文档类型以 doc/docx/sheet/wiki/bitable 为主；可按需扩展。
+ */
+async function listReadableDriveDocs(userAccessToken, options = {}) {
+  const maxPages = Math.min(Math.max(1, Number(options.maxPages) || 20), 60);
+  const pageSize = Math.min(Math.max(20, Number(options.pageSize) || 200), 200);
+  const all = [];
+  const queue = [""];
+  const visitedFolders = new Set();
+  let pageBudget = maxPages;
+  while (queue.length > 0 && pageBudget > 0) {
+    const folderToken = String(queue.shift() || "");
+    if (visitedFolders.has(folderToken)) continue;
+    visitedFolders.add(folderToken);
+    let pageToken = "";
+    for (;;) {
+      if (pageBudget <= 0) break;
+      pageBudget -= 1;
+      const u = new URL("https://open.feishu.cn/open-apis/drive/v1/files");
+      u.searchParams.set("page_size", String(pageSize));
+      if (folderToken) u.searchParams.set("folder_token", folderToken);
+      if (pageToken) u.searchParams.set("page_token", pageToken);
+      const res = await fetch(u.toString(), {
+        headers: { Authorization: `Bearer ${userAccessToken}` },
+      });
+      const data = await res.json();
+      if (data.code !== 0) {
+        throw syncError(data.msg || `拉取可读云文档失败: ${JSON.stringify(data)}`, data, {
+          step: "drive_files_list",
+          folderToken,
+        });
+      }
+      const files = Array.isArray(data?.data?.files) ? data.data.files : [];
+      all.push(...files);
+      for (const f of files) {
+        if (!f || typeof f !== "object") continue;
+        const type = String(f.type || "");
+        if (type === "folder") {
+          const token = String(f.token || "");
+          if (token && !visitedFolders.has(token)) queue.push(token);
+        }
+      }
+      const hasMore = Boolean(data?.data?.has_more);
+      pageToken = typeof data?.data?.next_page_token === "string" ? data.data.next_page_token : "";
+      if (!hasMore || !pageToken) break;
+    }
+  }
+  const allowTypes = new Set(["doc", "docx", "sheet", "wiki", "bitable"]);
+  const dedup = new Map();
+  for (const f of all) {
+    if (!f || typeof f !== "object") continue;
+    const type = String(f.type || "");
+    if (!allowTypes.has(type)) continue;
+    const token = String(f.token || "");
+    const title = String(f.name || f.title || token || "未命名文档");
+    const url = typeof f.url === "string" && f.url.trim() ? f.url.trim() : buildFeishuDocWebUrl(type, token);
+    const id = `${type}:${token || title}`;
+    const updatedAtRaw = Number(f.modified_time || f.updated_time || Date.now());
+    const updatedAt = Number.isFinite(updatedAtRaw) ? updatedAtRaw : Date.now();
+    dedup.set(id, { id, title, type, token, url, updatedAt });
+  }
+  return [...dedup.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/**
+ * 飞书 search/v2 文档与知识库搜索，可发现「非我创建但有阅读权」等 Drive 树未列全的文档（需应用具备 search:docs:read 等搜索类权限，以开发者后台为准）。
+ * 返回结构会随平台调整，这里对常见字段做了兼容解析。
+ */
+function normalizeDocWikiSearchItem(hit) {
+  if (!hit || typeof hit !== "object") return null;
+  const tRaw = String(
+    hit.obj_type || hit.document_type || hit.docs_type || hit.doc_type || hit.type || "docx",
+  )
+    .toLowerCase()
+    .replace(/\s+/g, "");
+  let type = "docx";
+  if (tRaw.includes("sheet")) type = "sheet";
+  else if (tRaw.includes("bitable") || tRaw === "base") type = "bitable";
+  else if (tRaw.includes("wiki")) type = "wiki";
+  else if (tRaw === "doc" && !tRaw.includes("docx")) type = "doc";
+  const token = String(
+    hit.doc_token || hit.docs_token || hit.obj_token || hit.token || hit.id || "",
+  ).trim();
+  if (!token) return null;
+  const title = String(hit.title || hit.name || hit.summary || "未命名文档");
+  let url = typeof hit.url === "string" && hit.url.trim() ? hit.url.trim() : "";
+  if (!url) url = buildFeishuDocWebUrl(type, token);
+  const upd = Number(
+    hit.edit_time || hit.last_edit_time || hit.last_open_time || hit.update_time || hit.modified_time,
+  );
+  const updatedAt = Number.isFinite(upd) && upd > 0 ? upd * (upd < 1e12 ? 1000 : 1) : Date.now();
+  return { id: `${type}:${token}`, title, type, token, url, updatedAt };
+}
+
+function extractSearchDocsFromResponse(data) {
+  const d = data?.data;
+  const raw = []
+    .concat(Array.isArray(d?.docs) ? d.docs : [])
+    .concat(Array.isArray(d?.items) ? d.items : [])
+    .concat(Array.isArray(d?.doc_list) ? d.doc_list : []);
+  const out = [];
+  for (const hit of raw) {
+    const n = normalizeDocWikiSearchItem(hit);
+    if (n) out.push(n);
+  }
+  return out;
+}
+
+async function feishuSearchDocWikiRequest(userAccessToken, body) {
+  const res = await fetch("https://open.feishu.cn/open-apis/search/v2/doc_wiki/search", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${userAccessToken}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+/**
+ * 按关键词搜索当前用户可访问的在线文档/wiki（多页，与 Drive 列表合并前可二次去重）。
+ */
+async function collectDocWikiSearch(userAccessToken, query, options = {}) {
+  const maxPages = Math.min(Math.max(1, Number(options.maxPages) || 3), 20);
+  const q = String(query || "").trim().slice(0, 50);
+  if (!q) return { docs: [], searchError: null };
+  const seen = new Map();
+  let searchError = null;
+  let pageToken = "";
+  for (let p = 0; p < maxPages; p++) {
+    const body = {
+      query: q,
+      page_size: 20,
+      doc_filter: {
+        doc_types: ["DOCX", "DOC", "SHEET", "BITABLE"],
+      },
+    };
+    if (pageToken) body.page_token = pageToken;
+    const data = await feishuSearchDocWikiRequest(userAccessToken, body);
+    if (data.code !== 0) {
+      searchError = data.msg || JSON.stringify(data);
+      break;
+    }
+    for (const doc of extractSearchDocsFromResponse(data)) seen.set(doc.id, doc);
+    const hasMore = Boolean(data?.data?.has_more);
+    pageToken =
+      typeof data?.data?.page_token === "string"
+        ? data.data.page_token
+        : typeof data?.data?.next_page_token === "string"
+          ? data.data.next_page_token
+          : "";
+    if (!hasMore || !pageToken) break;
+  }
+  const wikiTry = await feishuSearchDocWikiRequest(userAccessToken, {
+    query: q,
+    page_size: 20,
+    wiki_filter: {
+      doc_types: ["WIKI"],
+    },
+  });
+  if (wikiTry.code === 0) {
+    for (const doc of extractSearchDocsFromResponse(wikiTry)) seen.set(doc.id, doc);
+  }
+  return { docs: [...seen.values()], searchError };
+}
+
+/** 同步时用若干种子词扩展搜索，尽量覆盖共享文档（仍受租户搜索权限限制）。 */
+async function expandDriveDocsWithSearch(userAccessToken, driveDocs, options = {}) {
+  const seeds = Array.isArray(options.searchSeeds)
+    ? options.searchSeeds.filter((x) => typeof x === "string")
+    : ["报告", "方案", "测试", "总结", "FA"];
+  const maxSeedQueries = Math.min(Math.max(1, Number(options.maxSeedQueries) || 6), 12);
+  const dedup = new Map();
+  for (const d of driveDocs) dedup.set(d.id, d);
+  let lastErr = null;
+  for (const seed of seeds.slice(0, maxSeedQueries)) {
+    try {
+      const { docs, searchError } = await collectDocWikiSearch(userAccessToken, seed, { maxPages: 2 });
+      if (searchError && docs.length === 0) lastErr = searchError;
+      for (const doc of docs) dedup.set(doc.id, doc);
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { docs: [...dedup.values()].sort((a, b) => b.updatedAt - a.updatedAt), expandWarning: lastErr };
+}
+
+async function webSearchLite(query) {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_html=1&skip_disambig=1`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const out = [];
+  const abstract = typeof data?.AbstractText === "string" ? data.AbstractText.trim() : "";
+  const abstractUrl = typeof data?.AbstractURL === "string" ? data.AbstractURL : "";
+  if (abstract) out.push({ title: data?.Heading || q, snippet: abstract, url: abstractUrl });
+  const related = Array.isArray(data?.RelatedTopics) ? data.RelatedTopics : [];
+  for (const t of related) {
+    if (!t || typeof t !== "object") continue;
+    if (typeof t.Text === "string" && t.Text.trim()) {
+      out.push({ title: q, snippet: t.Text.trim(), url: typeof t.FirstURL === "string" ? t.FirstURL : "" });
+    }
+    if (Array.isArray(t.Topics)) {
+      for (const s of t.Topics) {
+        if (s && typeof s === "object" && typeof s.Text === "string" && s.Text.trim()) {
+          out.push({
+            title: q,
+            snippet: s.Text.trim(),
+            url: typeof s.FirstURL === "string" ? s.FirstURL : "",
+          });
+        }
+      }
+    }
+    if (out.length >= 8) break;
+  }
+  return out.slice(0, 8);
+}
+
+/** 知识库网页链接学习：粗提取可见文本（非完整渲染） */
+function stripHtmlToPlainText(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (_, n) => {
+      const code = Number(n);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function sendJson(res, status, body, origin) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -641,6 +893,197 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "POST" && pathname === "/api/list-feishu-readable-docs") {
+    if (!checkApiKey(req, res, origin)) return;
+    try {
+      const body = await readBody(req);
+      const userAccessToken =
+        typeof body?.userAccessToken === "string" ? body.userAccessToken.trim() : "";
+      if (userAccessToken.length < 10) {
+        sendJson(
+          res,
+          400,
+          {
+            ok: false,
+            error: "missing_user_access_token",
+            message: "请先完成飞书 OAuth 登录，提供 userAccessToken。",
+          },
+          origin,
+        );
+        return;
+      }
+      const driveDocs = await listReadableDriveDocs(userAccessToken, {
+        maxPages: body?.maxPages,
+        pageSize: body?.pageSize,
+      });
+      const merged = await expandDriveDocsWithSearch(userAccessToken, driveDocs, {
+        maxSeedQueries: body?.maxSeedQueries,
+        searchSeeds: Array.isArray(body?.searchSeeds) ? body.searchSeeds : undefined,
+      });
+      const docs = merged.docs;
+      sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          total: docs.length,
+          driveListingCount: driveDocs.length,
+          mergedSearch: docs.length > driveDocs.length,
+          docs,
+          hint:
+            docs.length === 0
+              ? "接口可用但返回 0 条：请确认该账号在飞书中确有可读文档，且应用权限已发布并重新授权。"
+              : undefined,
+          expandWarning: merged.expandWarning || undefined,
+        },
+        origin,
+      );
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      const feishuResponse =
+        e && typeof e === "object" && "feishuResponse" in e ? e.feishuResponse : undefined;
+      sendJson(
+        res,
+        500,
+        {
+          ok: false,
+          error: "list_readable_docs_failed",
+          message,
+          feishuResponse: feishuResponse ?? null,
+        },
+        origin,
+      );
+    }
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/web-search-lite") {
+    if (!checkApiKey(req, res, origin)) return;
+    try {
+      const body = await readBody(req);
+      const query = typeof body?.query === "string" ? body.query : "";
+      const items = await webSearchLite(query);
+      sendJson(res, 200, { ok: true, items }, origin);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      sendJson(res, 500, { ok: false, error: "web_search_failed", message }, origin);
+    }
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/fetch-url-text") {
+    if (!checkApiKey(req, res, origin)) return;
+    try {
+      const body = await readBody(req);
+      const raw = typeof body?.url === "string" ? body.url.trim() : "";
+      if (!raw || !/^https?:\/\//i.test(raw)) {
+        sendJson(res, 400, { ok: false, error: "invalid_url", message: "需要 http(s) 链接" }, origin);
+        return;
+      }
+      const u = new URL(raw);
+      if (!["http:", "https:"].includes(u.protocol)) {
+        sendJson(res, 400, { ok: false, error: "invalid_protocol", message: "仅支持 http/https" }, origin);
+        return;
+      }
+      const host = u.hostname.toLowerCase();
+      if (
+        host === "localhost" ||
+        host === "127.0.0.1" ||
+        host === "0.0.0.0" ||
+        host === "::1" ||
+        host.endsWith(".local")
+      ) {
+        sendJson(res, 400, { ok: false, error: "blocked_host", message: "禁止抓取本机与内网类地址" }, origin);
+        return;
+      }
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 22_000);
+      const resFetch = await fetch(raw, {
+        redirect: "follow",
+        signal: ctrl.signal,
+        headers: {
+          "User-Agent": "FA-Workbench-KnowledgeLearn/1.0",
+          Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+        },
+      });
+      clearTimeout(timer);
+      const ct = (resFetch.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      const buf = Buffer.from(await resFetch.arrayBuffer());
+      const maxBytes = 2 * 1024 * 1024;
+      const slice = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+      let text = "";
+      if (ct.includes("json")) {
+        const s = slice.toString("utf8");
+        try {
+          text = JSON.stringify(JSON.parse(s));
+        } catch {
+          text = s;
+        }
+      } else {
+        text = stripHtmlToPlainText(slice.toString("utf8"));
+      }
+      const maxChars = 400_000;
+      if (text.length > maxChars) text = `${text.slice(0, maxChars)}\n…（已截断）`;
+      sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          text,
+          finalUrl: resFetch.url,
+          contentType: ct,
+          truncatedBytes: buf.length > maxBytes,
+        },
+        origin,
+      );
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      sendJson(res, 500, { ok: false, error: "fetch_url_failed", message }, origin);
+    }
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/search-feishu-docs") {
+    if (!checkApiKey(req, res, origin)) return;
+    try {
+      const body = await readBody(req);
+      const userAccessToken =
+        typeof body?.userAccessToken === "string" ? body.userAccessToken.trim() : "";
+      const query = typeof body?.query === "string" ? body.query : "";
+      if (userAccessToken.length < 10) {
+        sendJson(
+          res,
+          400,
+          {
+            ok: false,
+            error: "missing_user_access_token",
+            message: "请先完成飞书 OAuth 登录，提供 userAccessToken。",
+          },
+          origin,
+        );
+        return;
+      }
+      const { docs, searchError } = await collectDocWikiSearch(userAccessToken, query, {
+        maxPages: body?.maxPages,
+      });
+      sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          total: docs.length,
+          docs,
+          searchWarning: searchError || undefined,
+        },
+        origin,
+      );
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      sendJson(res, 500, { ok: false, error: "search_feishu_docs_failed", message }, origin);
+    }
+    return;
+  }
+
   if (req.method !== "POST" || pathname !== "/api/sync-feishu") {
     sendJson(
       res,
@@ -771,7 +1214,9 @@ server.listen(PORT, () => {
     console.log("[sync-server] 提示：公网部署建议设置 SYNC_API_KEY，避免接口被任意调用");
   }
   console.log(`[sync-server] insertDataOption: ${INSERT_DATA_OPTION}`);
-  console.log("[sync-server] POST /api/sync-feishu  |  POST /api/fetch-feishu-doc");
+  console.log(
+    "[sync-server] POST /api/sync-feishu  |  POST /api/fetch-feishu-doc  |  POST /api/fetch-url-text  |  POST /api/list-feishu-readable-docs  |  POST /api/web-search-lite",
+  );
   if (OAUTH_REDIRECT_URI) {
     console.log("[sync-server] 飞书用户 OAuth 已配置：GET /api/auth/feishu/login → callback");
   }

@@ -300,11 +300,54 @@
 }
 
 .detailPanel {
-  width: 300px;
+  width: 320px;
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   background: var(--surface);
   border-left: 1px solid var(--border);
   box-shadow: -4px 0 24px rgba(15, 23, 42, 0.04);
+}
+
+.railTabs {
+  flex-shrink: 0;
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  background: #f8fafc;
+}
+
+.railTab {
+  flex: 1;
+  margin: 0;
+  padding: 0.5rem 0.35rem;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.railTab:hover {
+  color: var(--text);
+  background: rgba(59, 130, 246, 0.06);
+}
+
+.railTabActive {
+  color: var(--accent-from);
+  border-bottom-color: rgba(59, 130, 246, 0.65);
+  background: #fff;
+}
+
+.railBody {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .detailInner {

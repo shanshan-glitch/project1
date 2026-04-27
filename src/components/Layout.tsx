@@ -62,8 +62,7 @@ const panelByPath: Record<string, { title: string; lines: string[] }> = {
   "/qa": {
     title: "知识问答",
     lines: [
-      "结合知识库与术语，支持流程与原理类检索。",
-      "后续可接入向量检索以增强召回。",
+      "结合知识库、飞书文档与联网检索；当前默认使用本地归纳与引用展示。",
     ],
   },
   "/intel": {
